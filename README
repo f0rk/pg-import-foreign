@@ -1,0 +1,86 @@
+Import a remote database's schema locally using foreign data wrappers
+
+Call pg-import-foreign with -h for help.
+
+Requires python and psycopg2. Must be used with postgres 9.3+
+
+Examples:
+
+~$ psql -d herp
+[herp]> create table foreign_test (id serial primary key, value text);
+CREATE TABLE
+[herp]> \q
+~$ pg-import-foreign \
+>    --local-database derp \
+>    --local-user ryan \
+>    --local-password XXX \
+>    --local-host localhost \
+>    --local-port 5432 \
+>    --local-schema public \
+>    --remote-database herp \
+>    --remote-user ryan \
+>    --remote-password YYY \
+>    --remote-host localhost \
+>    --remote-port 5432 \
+>    --remote-schema public \
+>    --verbose
+create extension if not exists postgres_fdw
+create extension if not exists dblink
+
+            create server "pif_localhost_herp"
+                foreign data wrapper postgres_fdw
+                options (host 'localhost', dbname 'herp', port '5432')
+            
+
+            create user mapping for "ryan"
+                server "pif_localhost_herp"
+                options (user 'ryan', password 'YYY')
+            
+
+            create or replace function "public".pif_shitty_nextval(schema_name text, seq_name text)
+            returns bigint
+            as $$
+            declare
+                nv bigint;
+            begin
+                select
+                    nextval
+                into
+                    nv
+                from
+                    dblink('dbname=''herp'' user=''ryan'' password=''YYY'' host=''localhost'' port=''5432''', 'select nextval(''' || quote_ident(schema_name) || '.' || quote_ident(seq_name) || '''::regclass)') u(nextval bigint)
+                limit
+                    1
+                ;
+
+                return nv;
+            end;
+            $$ language plpgsql;
+            
+create foreign table "public"."foreign_test" (
+    "id" integer default "public".pif_shitty_nextval('public', 'foreign_test_id_seq'),
+    "value" text
+)
+server "pif_localhost_herp"
+options (schema_name 'public', table_name 'foreign_test')
+~$ psql -d derp
+[derp]> insert into foreign_test (id, value) values (default, 'hi');
+INSERT 0 1
+[derp]> select * from foreign_test;
+ id | value 
+----+-------
+  1 | hi
+[derp]> update foreign_test set value = 'hello' where id = 1;
+UPDATE 1
+[derp]> select * from foreign_test;
+ id | value 
+----+-------
+  1 | hello
+[derp]>
+
+Magic.
+
+You'll note the creation of an odd looking shitty nextval function, as well as
+the use of dblink. The FDW infrastructure basically doesn't work with serial
+primary keys, so this is a workaround for that.
+

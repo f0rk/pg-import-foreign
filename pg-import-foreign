@@ -1,0 +1,626 @@
+#!/usr/bin/env python
+
+import re
+import argparse
+
+import psycopg2
+
+
+class Importer(object):
+
+    def __init__(self, local_database, local_user, local_password, local_host,
+                 local_port, local_schema, remote_database, remote_user,
+                 remote_password, remote_host, remote_port, remote_schema,
+                 verbose=False):
+        """Create an importer to import a remote database's table-like objects
+        from the given schema into the given "local" database's schema.
+
+        :param local_database: The name of the local database to import into.
+        :param local_user: The user to connect to the local database as.
+        :param local_password: The password to connect to the local database
+            with.
+        :param local_host: The host of the local database.
+        :param local_port: The port of the local database.
+        :param local_schema: The schema on the local database to create objects
+            in.
+
+        :param remote_database: The name of the remote database to read from.
+        :param remote_user: The user to connect to the remote database as.
+        :param remote_password: The password to connect to the remote database
+            with.
+        :param remote_host: The host of the remote database.
+        :param remote_port: The port of the remote database.
+        :param remote_schema: The schema on the remote database to reflect
+            objects from.
+
+        :param verbose: If True, print SQL statements out as the script runs
+            (default: False).
+
+        """
+
+        self.local_database = local_database
+        self.local_user = local_user
+        self.local_password = local_password
+        self.local_host = local_host
+        self.local_port = local_port
+        self.local_schema = local_schema
+
+        self.remote_database = remote_database
+        self.remote_user = remote_user
+        self.remote_password = remote_password
+        self.remote_host = remote_host
+        self.remote_port = remote_port
+        self.remote_schema = remote_schema
+
+        self.verbose = verbose
+
+    def run(self):
+
+        conn = None
+        remote_conn = None
+        cur = None
+        remote_cur = None
+
+        try:
+
+            # connect to our databases
+            conn, remote_conn = self.connect()
+
+            # get ourselves a cursor
+            cur = conn.cursor()
+            remote_cur = remote_conn.cursor()
+
+            # check that any necessary extensions are installed
+            self.try_install_extensions(cur, remote_cur)
+
+            # get the name of our foreign server
+            foreign_server = self.foreign_server_name()
+
+            # cine an appropriate foreign server object
+            self.try_create_foreign_server(cur, foreign_server)
+
+            # cine as appropriate user mapping
+            self.try_create_user_mapping(cur, foreign_server)
+
+            # reflect remote schema by querying catalog tables
+            objects = self.reflect_schema(remote_cur, self.remote_schema)
+
+            # empty local schema, per arguments
+            self.empty_local_schema(cur, self.local_schema, objects)
+
+            # to support sequence defaults, we need to roll our own default
+            # function that uses dblink, see:
+            # http://www.postgresql.org/message-id/26654.1380145647@sss.pgh.pa.us
+            self.create_shitty_nextval_function(cur, self.remote_database,
+                                                self.remote_user,
+                                                self.remote_password,
+                                                self.remote_host,
+                                                self.remote_port,
+                                                self.local_schema)
+
+            # create foreign tables in local schema
+            self.populate_local_schema(cur, remote_cur, foreign_server,
+                                       self.local_schema, self.remote_schema,
+                                       objects)
+
+            # commit (no commit on remote, should only be read there)
+            conn.commit()
+
+        finally:
+            if cur is not None:
+                cur.close()
+
+            if remote_cur is not None:
+                remote_cur.close()
+
+            if conn is not None:
+                conn.close()
+
+            if remote_conn is not None:
+                remote_conn.close()
+
+    def connect(self):
+        """Create a connection to our databases."""
+
+        conn = psycopg2.connect(database=self.local_database,
+                                user=self.local_user,
+                                password=self.local_password,
+                                host=self.local_host, port=self.local_port)
+
+        remote_conn = psycopg2.connect(database=self.remote_database,
+                                       user=self.remote_user,
+                                       password=self.remote_password,
+                                       host=self.remote_host,
+                                       port=self.remote_port)
+
+        return conn, remote_conn
+
+    def try_install_extensions(self, cur, remote_cur):
+        """Ensure that the postgres_fdw extension is available and installed.
+
+        :param cur: A psycopg2 cursor object to the local server.
+        :param remote_cur: A psycopg2 cursor object to the remote server.
+
+        """
+
+        # try to create the postgres fdw extension
+        stmt = "create extension if not exists postgres_fdw"
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+        # try to create the dblink extension. we need this to support default
+        # inserting into tables with sequences...
+        stmt = "create extension if not exists dblink"
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+        # if the remote side has the hstore or postgis extensions installed,
+        # install them here, too. check in pg_type as well because @reason
+        # (real reason: dump and restore has given us hstore, but without the
+        # extension... hurf)
+        remote_cur.execute("""
+            select
+                extname
+            from
+                pg_catalog.pg_extension
+            where
+                extname in (
+                    'hstore',
+                    'postgis'
+                )
+            union
+            select
+                typname
+            from
+                pg_catalog.pg_type
+            where
+                typname = 'hstore'
+            """)
+
+        extensions = remote_cur.fetchall()
+        for extension in extensions:
+            stmt = "create extension if not exists {}".format(extension[0])
+            if self.verbose:
+                print(stmt)
+            cur.execute(stmt)
+
+    def foreign_server_name(self):
+        """Return the name of the foreign server as assumed by this module."""
+
+        foreign_server = "pif_{}_{}".format(self.remote_host,
+                                            self.remote_database)
+
+        return foreign_server
+
+    def try_create_foreign_server(self, cur, foreign_server):
+        """Create a foreign server for our use. This method attempts to create
+        a foreign server with the given name. If you need to change the
+        connection parameters or other options, you should manually drop the
+        server.
+
+        :param cur: A psycopg2 cursor object.
+        :param foreign_server: The name of the foreign server to create.
+
+        """
+
+        cur.execute("""
+            select
+                count(*)
+            from
+                pg_catalog.pg_foreign_server
+            where
+                srvname = %s
+            """, (foreign_server, ))
+        res = cur.fetchone()
+
+        # no matching server found, create it
+        if res[0] == 0:
+            stmt = """
+            create server "{}"
+                foreign data wrapper postgres_fdw
+                options (host %s, dbname %s, port %s)
+            """.format(foreign_server)
+
+            stmt = cur.mogrify(stmt, (self.remote_host, self.remote_database,
+                                      self.remote_port))
+            if self.verbose:
+                print(stmt)
+            cur.execute(stmt)
+
+    def try_create_user_mapping(self, cur, foreign_server):
+        """Create a user mapping for the current user for given foreign server.
+        If the user mapping already exists, an update will be attempted instead.
+
+        :param cur: A psycopg2 cursor object.
+        :param foreign_server: The name of the foreign server.
+
+        """
+
+        user_option = "user={}".format(self.remote_user)
+
+        cur.execute("""
+            select
+                count(*)
+            from
+                pg_catalog.pg_user_mapping a
+            join
+                pg_user b
+            on
+                a.umuser = b.usesysid
+            where
+                %s = any(a.umoptions)
+                and b.usename = %s
+            """, (user_option, self.local_user))
+        res = cur.fetchone()
+
+        if res[0] == 0:
+            stmt = """
+            create user mapping for "{}"
+                server "{}"
+                options (user %s, password %s)
+            """.format(self.local_user, foreign_server)
+
+            stmt = cur.mogrify(stmt, (self.remote_user, self.remote_password))
+            if self.verbose:
+                print(stmt)
+
+            cur.execute(stmt)
+        else:
+            stmt = """
+            alter user mapping for "{}"
+                server "{}"
+                options (set password %s)
+            """.format(self.local_user, foreign_server)
+
+            stmt = cur.mogrify(stmt, (self.remote_password,))
+            if self.verbose:
+                print(stmt)
+            cur.execute(stmt)
+
+    def table_exists(self, cur, local_schema, local_table):
+        """See if the table of the given name exists.
+
+        :param cur: A psycopg2 cursor object.
+        :param local_schema: The local schema to look in.
+        :param local_table: The name of the table locally.
+
+        """
+
+        cur.execute("""
+            select
+                count(*)
+            from
+                pg_namespace a
+            join
+                pg_class b
+            on
+                a.oid = b.relnamespace
+            where
+                a.nspname = %s
+                and b.relname = %s
+            """, (local_schema, local_table))
+        res = cur.fetchone()
+
+        if res[0]:
+            return True
+        else:
+            return False
+
+    def create_shitty_nextval_function(self, cur, database, user, password,
+                                       host, port, schema):
+        """Because postgres_fdw doesn't really do anything useful with columns
+        that have a default value from a sequence, we need to create a bogus
+        nextval function that reads the appropriate values from the remote side.
+        since this isn't really possible with the FDW itself, we use dblink.
+
+        :param cur: A psycopg2 cursor object.
+        :param database: The database to connect to with dblink.
+        :param user: The user to connect with for dblink.
+        :param password: The password to connect with for dblink.
+        :param host: The host to connect to with dblink.
+        :param port: The port to connect to with dblink.
+        :param schema: The name of the schema to create the function in.
+
+        """
+
+        connection_string = (
+            "dbname='{}' user='{}' password='{}' host='{}' port='{}'"
+            .format(database, user, password, host, port)
+        )
+
+        connection_string = connection_string.replace("'", "''")
+
+        stmt = """
+            create or replace function "{}".pif_shitty_nextval(schema_name text, seq_name text)
+            returns bigint
+            as $$
+            declare
+                nv bigint;
+            begin
+                select
+                    nextval
+                into
+                    nv
+                from
+                    dblink('{}', 'select nextval(''' || quote_ident(schema_name) || '.' || quote_ident(seq_name) || '''::regclass)') u(nextval bigint)
+                limit
+                    1
+                ;
+
+                return nv;
+            end;
+            $$ language plpgsql;
+            """.format(schema, connection_string)
+
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def mirror_remote_object(self, cur, remote_cur, foreign_server,
+                             remote_schema, remote_table, local_schema,
+                             local_table, columns):
+        """Mirror the given remote object to the given local name.
+
+        :param cur: A psycopg2 cursor object to the local server.
+        :param remote_cur: A psycopg2 cursor object to the remote server.
+        :param foreign_server: The name of the foreign server.
+        :param remote_schema: The name of the schema on the remote.
+        :param remote_table: The name of the table on the remote.
+        :param local_schema: The local schema to create the table into.
+        :param local_table: The local name to give the newly-created table.
+        :param columns: The columns of the table.
+
+        """
+
+        # assemble a create table statement
+        create = 'create foreign table "{}"."{}" (\n'.format(local_schema,
+                                                             local_table)
+
+        columns_clause = []
+        for name, type, default in columns:
+            name = name.replace("%", "%%")
+            clause = '    "{}" {}'.format(name, type)
+
+            if default:
+                match = re.search(r'^nextval\(\'(.+?)\'::regclass\)', default)
+                if match:
+                    seq = match.groups()[0]
+
+                    remote_cur.execute("""
+                        select
+                            a.nspname,
+                            b.relname
+                        from
+                            pg_catalog.pg_namespace a
+                        join
+                            pg_catalog.pg_class b
+                        on
+                            a.oid = b.relnamespace
+                        where
+                            b.oid = (%s)::regclass
+                        """, (seq,))
+
+                    seq_schema, seq_name = remote_cur.fetchone()
+                    
+                    new_default = (
+                        "\"{}\".pif_shitty_nextval('{}', '{}')"
+                        .format(local_schema, seq_schema, seq_name)
+                    )
+                    clause += " default " + new_default
+
+            columns_clause.append(clause)
+
+        create += ",\n".join(columns_clause)
+
+        create += "\n)\n"
+        create += 'server "{}"\n'.format(foreign_server)
+        create += "options (schema_name %s, table_name %s)"
+
+        stmt = cur.mogrify(create, (remote_schema, remote_table))
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def object_column_definitions(self, cur, schema, name):
+        """Read column definitions from the given object.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the remote object.
+        :param name: The name of the remote object.
+
+        """
+
+        cur.execute("""
+            select
+                c.attname,
+                pg_catalog.format_type(c.atttypid, c.atttypmod),
+                (
+                    select
+                        pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+                    from
+                        pg_catalog.pg_attrdef d
+                    where
+                        d.adrelid = c.attrelid
+                        and d.adnum = c.attnum
+                        and c.atthasdef
+                )
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            join
+                pg_catalog.pg_attribute c
+            on
+                b.oid = c.attrelid
+            where
+                a.nspname = %s
+                and b.relname = %s
+                and c.attnum > 0
+                and not c.attisdropped
+            order by
+                c.attnum
+            """, (schema, name))
+        results = cur.fetchall()
+
+        return results
+
+    def reflect_schema(self, cur, schema):
+        """Return a a list of tuples of (name, object_type, [columns]) for each
+        reflected item from the remote side.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema on the schema to reflect.
+
+        """
+
+        cur.execute("""
+            select
+                b.relname,
+                b.relkind
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            where
+                b.relkind in ('r', 'v', 'f', 'm')
+                and a.nspname = %s
+                and b.relname not in (
+                    'spatial_ref_sys',
+                    'geometry_columns',
+                    'geography_columns',
+                    'raster_columns',
+                    'raster_overviews'
+                )
+            """, (schema,))
+        objects = cur.fetchall()
+
+        ret = []
+        for name, object_type in objects:
+            columns = self.object_column_definitions(cur, schema, name)
+            ret.append((name, object_type, columns))
+
+        return ret
+
+    def empty_local_schema(self, cur, local_schema, objects):
+        """Drop objects from the local schema.
+
+        :param cur: A psycopg2 cursor object.
+        :param local_schema: The schema to drop objects from.
+        :param objects: Objects reflect from the remote schema. If only matching
+            objects are to be dropped, or skip existing is specified, these are
+            used to determine what should be dropped.
+
+        """
+
+        local_objects = self.reflect_schema(cur, local_schema)
+
+        # XXX: implement matching only and skip existing
+
+        for name, object_type, columns in local_objects:
+            if object_type == "r":
+                stmt = 'drop table "{}"."{}"'.format(local_schema, name)
+                if self.verbose:
+                    print(stmt)
+                cur.execute(stmt)
+            elif object_type == "v":
+                stmt = 'drop view "{}"."{}"'.format(local_schema, name)
+                if self.verbose:
+                    print(stmt)
+                cur.execute(stmt)
+            elif object_type == "f":
+                stmt = 'drop foreign table "{}"."{}"'.format(local_schema, name)
+                if self.verbose:
+                    print(stmt)
+                cur.execute(stmt)
+            elif object_type == "m":
+                stmt = 'drop materialized view "{}"."{}"'.format(local_schema,
+                                                                 name)
+                if self.verbose:
+                    print(stmt)
+                cur.execute(stmt)
+            else:
+                raise Exception("Unexpected object type '{}'"
+                                .format(object_type))
+
+    def populate_local_schema(self, cur, remote_cur, foreign_server,
+                              local_schema, remote_schema, objects):
+        """Populate reflected objects from the remote schema as foreign tables
+        in the local schema.
+
+        :param cur: A psycopg2 cursor object to the local server.
+        :param remote_cur: A psycopg2 cursor object to the remote server.
+        :param foreign_server: The foreign server to create the tables with.
+        :param local_schema: The schema to create the tables in.
+        :param remote_schema: The remote schema that the objects were read from.
+        :param objects: The objects to create foreign tables for.
+
+        """
+
+        for name, _, columns in objects:
+            self.mirror_remote_object(cur, remote_cur, foreign_server,
+                                      remote_schema, name, local_schema, name,
+                                      columns)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--local-database", required=True)
+    parser.add_argument("--local-user", required=True)
+    parser.add_argument("--local-password", required=True)
+    parser.add_argument("--local-host", required=True)
+    parser.add_argument("--local-port", required=True)
+    parser.add_argument("--local-schema", required=True)
+
+    parser.add_argument("--remote-database", required=True)
+    parser.add_argument("--remote-user", required=True)
+    parser.add_argument("--remote-password", required=True)
+    parser.add_argument("--remote-host", required=True)
+    parser.add_argument("--remote-port", required=True)
+    parser.add_argument("--remote-schema", required=True)
+
+    parser.add_argument("--verbose", action="store_true", default=False)
+
+    parser.add_argument("--user-mapping-only", action="store_true",
+                        default=False)
+    
+    args = parser.parse_args()
+
+    importer = Importer(args.local_database, args.local_user,
+                        args.local_password, args.local_host,
+                        args.local_port, args.local_schema,
+                        args.remote_database, args.remote_user,
+                        args.remote_password, args.remote_host,
+                        args.remote_port, args.remote_schema,
+                        verbose=args.verbose)
+    if args.user_mapping_only:
+        conn = None
+        remote_conn = None
+        cur = None
+        try:
+            conn, remote_conn = importer.connect()
+
+            cur = conn.cursor()
+
+            foreign_server = importer.foreign_server_name()
+            importer.try_create_user_mapping(cur, foreign_server)
+
+            conn.commit()
+        finally:
+            if cur is not None:
+                cur.close()
+
+            if conn is not None:
+                conn.close()
+
+            if remote_conn is not None:
+                remote_conn.close()
+    else:
+        importer.run()
+
