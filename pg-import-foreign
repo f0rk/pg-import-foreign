@@ -11,7 +11,7 @@ class Importer(object):
     def __init__(self, local_database, local_user, local_password, local_host,
                  local_port, local_schema, remote_database, remote_user,
                  remote_password, remote_host, remote_port, remote_schema,
-                 verbose=False):
+                 read_only=False, objects=None, verbose=False):
         """Create an importer to import a remote database's table-like objects
         from the given schema into the given "local" database's schema.
 
@@ -33,6 +33,11 @@ class Importer(object):
         :param remote_schema: The schema on the remote database to reflect
             objects from.
 
+        :param read_only: If True, the server will be marked as not updatable
+            (default: False, server is updatable).
+        :param objects: If given, a list of table names or view names that are
+            not schema qualified that should be reflected.
+
         :param verbose: If True, print SQL statements out as the script runs
             (default: False).
 
@@ -51,6 +56,9 @@ class Importer(object):
         self.remote_host = remote_host
         self.remote_port = remote_port
         self.remote_schema = remote_schema
+
+        self.read_only = read_only
+        self.objects = objects or None
 
         self.verbose = verbose
 
@@ -220,11 +228,36 @@ class Importer(object):
             stmt = """
             create server "{}"
                 foreign data wrapper postgres_fdw
-                options (host %s, dbname %s, port %s)
+                options (
+                    host %s,
+                    dbname %s,
+                    port %s,
+                    updatable %s
+                )
             """.format(foreign_server)
 
             stmt = cur.mogrify(stmt, (self.remote_host, self.remote_database,
-                                      self.remote_port))
+                                      self.remote_port,
+                                      str(not self.read_only).lower()))
+            if self.verbose:
+                print(stmt)
+            cur.execute(stmt)
+
+        # alter the server with our given values
+        else:
+            stmt = """
+            alter server "{}"
+                options (
+                    set host %s,
+                    set dbname %s,
+                    set port %s,
+                    set updatable %s
+                )
+            """.format(foreign_server)
+
+            stmt = cur.mogrify(stmt, (self.remote_host, self.remote_database,
+                                      self.remote_port,
+                                      str(not self.read_only).lower()))
             if self.verbose:
                 print(stmt)
             cur.execute(stmt)
@@ -502,6 +535,10 @@ class Importer(object):
 
         ret = []
         for name, object_type in objects:
+
+            if self.objects is not None and name not in self.objects:
+                continue
+
             columns = self.object_column_definitions(cur, schema, name)
             ret.append((name, object_type, columns))
 
@@ -585,6 +622,9 @@ if __name__ == "__main__":
     parser.add_argument("--remote-port", required=True)
     parser.add_argument("--remote-schema", required=True)
 
+    parser.add_argument("--read-only", action="store_true", default=False)
+    parser.add_argument("--objects", default="")
+
     parser.add_argument("--verbose", action="store_true", default=False)
 
     parser.add_argument("--user-mapping-only", action="store_true",
@@ -592,12 +632,17 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
+    objects = None
+    if args.objects:
+        objects = [o.strip() for o in args.objects.split(",")]
+
     importer = Importer(args.local_database, args.local_user,
                         args.local_password, args.local_host,
                         args.local_port, args.local_schema,
                         args.remote_database, args.remote_user,
                         args.remote_password, args.remote_host,
                         args.remote_port, args.remote_schema,
+                        read_only=args.read_only, objects=objects,
                         verbose=args.verbose)
     if args.user_mapping_only:
         conn = None
