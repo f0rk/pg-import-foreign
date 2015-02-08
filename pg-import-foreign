@@ -226,7 +226,7 @@ class Importer(object):
         # no matching server found, create it
         if res[0] == 0:
             stmt = """
-            create server "{}"
+            create server {}
                 foreign data wrapper postgres_fdw
                 options (
                     host %s,
@@ -234,7 +234,7 @@ class Importer(object):
                     port %s,
                     updatable %s
                 )
-            """.format(foreign_server)
+            """.format(self.quote_ident(foreign_server))
 
             stmt = cur.mogrify(stmt, (self.remote_host, self.remote_database,
                                       self.remote_port,
@@ -246,14 +246,14 @@ class Importer(object):
         # alter the server with our given values
         else:
             stmt = """
-            alter server "{}"
+            alter server {}
                 options (
                     set host %s,
                     set dbname %s,
                     set port %s,
                     set updatable %s
                 )
-            """.format(foreign_server)
+            """.format(self.quote_ident(foreign_server))
 
             stmt = cur.mogrify(stmt, (self.remote_host, self.remote_database,
                                       self.remote_port,
@@ -290,10 +290,11 @@ class Importer(object):
 
         if res[0] == 0:
             stmt = """
-            create user mapping for "{}"
-                server "{}"
+            create user mapping for {}
+                server {}
                 options (user %s, password %s)
-            """.format(self.local_user, foreign_server)
+            """.format(self.quote_ident(self.local_user),
+                       self.quote_ident(foreign_server))
 
             stmt = cur.mogrify(stmt, (self.remote_user, self.remote_password))
             if self.verbose:
@@ -302,10 +303,11 @@ class Importer(object):
             cur.execute(stmt)
         else:
             stmt = """
-            alter user mapping for "{}"
-                server "{}"
+            alter user mapping for {}
+                server {}
                 options (set password %s)
-            """.format(self.local_user, foreign_server)
+            """.format(self.quote_ident(self.local_user),
+                       self.quote_ident(foreign_server))
 
             stmt = cur.mogrify(stmt, (self.remote_password,))
             if self.verbose:
@@ -360,13 +362,14 @@ class Importer(object):
 
         connection_string = (
             "dbname='{}' user='{}' password='{}' host='{}' port='{}'"
-            .format(database, user, password, host, port)
+            .format(self.escape(database), self.escape(user),
+                    self.escape(password), self.escape(host), self.escape(port))
         )
 
         connection_string = connection_string.replace("'", "''")
 
         stmt = """
-            create or replace function "{}".pif_shitty_nextval(schema_name text, seq_name text)
+            create or replace function {}.pif_shitty_nextval(schema_name text, seq_name text)
             returns bigint
             as $$
             declare
@@ -385,7 +388,7 @@ class Importer(object):
                 return nv;
             end;
             $$ language plpgsql;
-            """.format(schema, connection_string)
+            """.format(self.quote_ident(schema), connection_string)
 
         if self.verbose:
             print(stmt)
@@ -408,13 +411,14 @@ class Importer(object):
         """
 
         # assemble a create table statement
-        create = 'create foreign table "{}"."{}" (\n'.format(local_schema,
-                                                             local_table)
+        create = ("create foreign table {}.{} (\n"
+                   .format(self.quote_ident(local_schema),
+                           self.quote_ident(local_table)))
 
         columns_clause = []
         for name, type, default in columns:
             name = name.replace("%", "%%")
-            clause = '    "{}" {}'.format(name, type)
+            clause = '    {} {}'.format(self.quote_ident(name), type)
 
             if default:
                 match = re.search(r'^nextval\(\'(.+?)\'::regclass\)', default)
@@ -438,8 +442,9 @@ class Importer(object):
                     seq_schema, seq_name = remote_cur.fetchone()
                     
                     new_default = (
-                        "\"{}\".pif_shitty_nextval('{}', '{}')"
-                        .format(local_schema, seq_schema, seq_name)
+                        "{}.pif_shitty_nextval('{}', '{}')"
+                        .format(self.quote_ident(local_schema),
+                                self.escape(seq_schema), self.escape(seq_name))
                     )
                     clause += " default " + new_default
 
@@ -448,7 +453,7 @@ class Importer(object):
         create += ",\n".join(columns_clause)
 
         create += "\n)\n"
-        create += 'server "{}"\n'.format(foreign_server)
+        create += "server {}\n".format(self.quote_ident(foreign_server))
         create += "options (schema_name %s, table_name %s)"
 
         stmt = cur.mogrify(create, (remote_schema, remote_table))
@@ -561,23 +566,28 @@ class Importer(object):
 
         for name, object_type, columns in local_objects:
             if object_type == "r":
-                stmt = 'drop table "{}"."{}"'.format(local_schema, name)
+                stmt = "drop table {}.{}".format(self.quote_ident(local_schema),
+                                                 self.quote_ident(name))
                 if self.verbose:
                     print(stmt)
                 cur.execute(stmt)
             elif object_type == "v":
-                stmt = 'drop view "{}"."{}"'.format(local_schema, name)
+                stmt = "drop view {}.{}".format(self.quote_ident(local_schema),
+                                                self.quote_ident(name))
                 if self.verbose:
                     print(stmt)
                 cur.execute(stmt)
             elif object_type == "f":
-                stmt = 'drop foreign table "{}"."{}"'.format(local_schema, name)
+                stmt = ("drop foreign table {}.{}"
+                        .format(self.quote_ident(local_schema),
+                                self.quote_ident(name)))
                 if self.verbose:
                     print(stmt)
                 cur.execute(stmt)
             elif object_type == "m":
-                stmt = 'drop materialized view "{}"."{}"'.format(local_schema,
-                                                                 name)
+                stmt = ("drop materialized view {}.{}"
+                        .format(self.quote_ident(local_schema),
+                                self.quote_ident(name)))
                 if self.verbose:
                     print(stmt)
                 cur.execute(stmt)
@@ -603,6 +613,13 @@ class Importer(object):
             self.mirror_remote_object(cur, remote_cur, foreign_server,
                                       remote_schema, name, local_schema, name,
                                       columns)
+
+    def quote_ident(self, name):
+        name = name.replace('"', '""')
+        return '"' + name + '"'
+
+    def escape(self, val):
+        return val.replace("'", "''")
 
 
 if __name__ == "__main__":
